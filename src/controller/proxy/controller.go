@@ -36,6 +36,7 @@ import (
 	"github.com/goharbor/harbor/src/lib/orm"
 	proModels "github.com/goharbor/harbor/src/pkg/project/models"
 	model_tag "github.com/goharbor/harbor/src/pkg/tag/model/tag"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -51,6 +52,11 @@ var (
 	// Ctl is a global proxy controller instance
 	ctl  Controller
 	once sync.Once
+	// manifestBackfillGroup coalesces concurrent proxy-cache backfills of the
+	// same artifact, see goharbor/harbor#24220: a fleet of concurrent pulls
+	// after one cache miss spawns one backfill goroutine per request and they
+	// race each other pushing the same blobs/manifests to the local registry.
+	manifestBackfillGroup singleflight.Group
 )
 
 // Controller defines the operations related with pull through proxy
@@ -258,7 +264,7 @@ func (c *controller) ProxyManifest(ctx context.Context, art lib.ArtifactInfo, re
 			if len(artInfo.Digest) == 0 {
 				artInfo.Digest = dig
 			}
-			c.waitAndPushManifest(bCtx, remoteRepo, man, artInfo, ct, remote)
+			c.backfillManifest(bCtx, remoteRepo, man, artInfo, ct, remote)
 		}
 
 		// Query artifact after push
@@ -326,6 +332,22 @@ func (c *controller) waitAndPushManifest(ctx context.Context, remoteRepo string,
 		}
 	}
 	h.CacheContent(ctx, remoteRepo, man, art, r, contType)
+}
+
+// backfillManifest pushes the manifest (and its dependencies) fetched from
+// the remote registry into the local proxy cache.
+// goharbor/harbor#24220: dedup concurrent backfills on the (project,
+// repository, digest/tag) dimension — Repository already embeds the proxy
+// project name, ProjectName is kept in the key for readability. Concurrent
+// callers block until the first backfill finishes instead of racing it in
+// the local registry. Callers are already detached goroutines, so blocking
+// here costs nothing client-side.
+func (c *controller) backfillManifest(ctx context.Context, remoteRepo string, man distribution.Manifest, art lib.ArtifactInfo, contType string, r RemoteInterface) {
+	key := fmt.Sprintf("%s/%s:%s", art.ProjectName, art.Repository, getReference(art))
+	_, _, _ = manifestBackfillGroup.Do(key, func() (any, error) {
+		c.waitAndPushManifest(ctx, remoteRepo, man, art, contType, r)
+		return nil, nil
+	})
 }
 
 // getRemoteRepo get the remote repository name, used in proxy cache
