@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest"
@@ -253,4 +254,79 @@ func (suite *CacheTestSuite) TestManifestCache_push_fails() {
 
 func TestCacheTestSuite(t *testing.T) {
 	suite.Run(t, &CacheTestSuite{})
+}
+
+// withShrunkPushRetry shrinks the manifest push retry settings for unit
+// tests and restores the originals afterwards.
+func withShrunkPushRetry(limit int, interval time.Duration) func() {
+	origLimit, origInterval := manifestPushRetryLimit, manifestPushRetryBaseInterval
+	manifestPushRetryLimit = limit
+	manifestPushRetryBaseInterval = interval
+	return func() {
+		manifestPushRetryLimit = origLimit
+		manifestPushRetryBaseInterval = origInterval
+	}
+}
+
+func (suite *CacheTestSuite) TestManifestCache_CacheContent_RetriesOnPushFailure() {
+	defer withShrunkPushRetry(2, 10*time.Millisecond)()
+
+	manifest := ociManifest
+	man, desc, err := distribution.UnmarshalManifest(v1.MediaTypeImageManifest, []byte(manifest))
+	suite.Require().NoError(err)
+
+	ctx := context.Background()
+	repo := "library/hello-world"
+
+	artInfo := lib.ArtifactInfo{
+		Repository: repo,
+		Digest:     string(desc.Digest),
+		Tag:        "latest",
+	}
+
+	// goharbor/harbor#24220: first push attempts hit MANIFEST_BLOB_UNKNOWN
+	// because a referenced blob is still uploading to the local registry,
+	// the last retry after the blob lands succeeds.
+	blobUnknownErr := fmt.Errorf(`error occurred on manifest push to local: 400, body: {"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry"}]}`)
+	local := &localInterfaceMock{}
+	local.On("CheckDependencies", ctx, artInfo.Repository, man).Once().Return([]distribution.Descriptor{})
+	local.On("PushManifest", artInfo.Repository, artInfo.Tag, man).Times(3).Return(nil)
+	// matched oldest first: fail the first two attempts, succeed on the last one
+	local.On("PushManifest", artInfo.Repository, artInfo.Digest, man).Once().Return(blobUnknownErr)
+	local.On("PushManifest", artInfo.Repository, artInfo.Digest, man).Once().Return(blobUnknownErr)
+	local.On("PushManifest", artInfo.Repository, artInfo.Digest, man).Once().Return(nil)
+	defer local.AssertExpectations(suite.T())
+
+	mCache := &ManifestCache{local: local}
+	mCache.CacheContent(ctx, repo, man, artInfo, nil, "")
+}
+
+func (suite *CacheTestSuite) TestManifestCache_CacheContent_RetriesExhausted() {
+	defer withShrunkPushRetry(1, 10*time.Millisecond)()
+
+	manifest := ociManifest
+	man, desc, err := distribution.UnmarshalManifest(v1.MediaTypeImageManifest, []byte(manifest))
+	suite.Require().NoError(err)
+
+	ctx := context.Background()
+	repo := "library/hello-world"
+
+	artInfo := lib.ArtifactInfo{
+		Repository: repo,
+		Digest:     string(desc.Digest),
+		Tag:        "latest",
+	}
+
+	// push keeps failing: exactly initial attempt + manifestPushRetryLimit retries
+	pushErr := fmt.Errorf("error during manifest push referencing digest")
+	local := &localInterfaceMock{}
+	local.On("CheckDependencies", ctx, artInfo.Repository, man).Once().Return([]distribution.Descriptor{})
+	local.On("PushManifest", artInfo.Repository, artInfo.Digest, man).Once().Return(pushErr)
+	local.On("PushManifest", artInfo.Repository, artInfo.Digest, man).Once().Return(pushErr)
+	local.On("PushManifest", artInfo.Repository, artInfo.Tag, man).Once().Return(pushErr)
+	local.On("PushManifest", artInfo.Repository, artInfo.Tag, man).Once().Return(pushErr)
+	defer local.AssertExpectations(suite.T())
+
+	mCache := &ManifestCache{local: local}
+	mCache.CacheContent(ctx, repo, man, artInfo, nil, "")
 }

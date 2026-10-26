@@ -35,6 +35,18 @@ import (
 
 const defaultHandler = "default"
 
+// Retry tuning for the local manifest push in ManifestCache.CacheContent,
+// see goharbor/harbor#24220. The first push after a cache miss can fail
+// transiently with MANIFEST_BLOB_UNKNOWN when a referenced blob is still
+// being uploaded to the local registry by a concurrent backfill. Defaults
+// to 3 retries with exponential backoff (10s/20s/40s, ~70s retry window),
+// sized to cover the fallback blob upload of a missing blob observed to
+// take ~48s. Vars instead of consts so unit tests can shrink the intervals.
+var (
+	manifestPushRetryLimit        = 3
+	manifestPushRetryBaseInterval = 10 * time.Second
+)
+
 // NewCacheHandlerRegistry ...
 func NewCacheHandlerRegistry(local localInterface) map[string]ManifestCacheHandler {
 	manListHandler := &ManifestListCache{
@@ -212,7 +224,23 @@ func (m *ManifestCache) CacheContent(ctx context.Context, remoteRepo string, man
 		}
 	}
 
-	err := m.push(art, man)
+	// goharbor/harbor#24220: the manifest push can transiently fail with
+	// MANIFEST_BLOB_UNKNOWN when a referenced blob is still in flight to the
+	// local registry (the blob lands seconds later), so the push is retryable.
+	// Without retry the manifest is never cached and every later pull of it
+	// stays a remote miss. Retry with backoff; push is idempotent so a retry
+	// after a partially failed attempt is safe.
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = m.push(art, man)
+		if err == nil || attempt >= manifestPushRetryLimit {
+			break
+		}
+		backoff := manifestPushRetryBaseInterval << attempt
+		log.Infof("manifest push to local failed (attempt %v/%v), retrying in %v, error: %v",
+			attempt+1, manifestPushRetryLimit+1, backoff, err)
+		time.Sleep(backoff)
+	}
 	if err != nil {
 		log.Errorf("error occurred on manifest push to local: %v", err)
 	}

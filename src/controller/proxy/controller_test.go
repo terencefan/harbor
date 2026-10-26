@@ -17,10 +17,14 @@ package proxy
 import (
 	"context"
 	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/docker/distribution"
 	"github.com/opencontainers/go-digest"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
@@ -252,4 +256,83 @@ func TestGetRef(t *testing.T) {
 			}
 		})
 	}
+}
+
+// gateCacheHandler is a ManifestCacheHandler that records concurrency and
+// blocks the first caller until it is released, so a test can hold the
+// backfill open while concurrent callers pile up on the singleflight.
+type gateCacheHandler struct {
+	entered     chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	total       int32
+	inFlight    int32
+	maxInFlight int32
+}
+
+func (g *gateCacheHandler) CacheContent(ctx context.Context, remoteRepo string, man distribution.Manifest, art lib.ArtifactInfo, r RemoteInterface, contentType string) {
+	atomic.AddInt32(&g.total, 1)
+	cur := atomic.AddInt32(&g.inFlight, 1)
+	for {
+		m := atomic.LoadInt32(&g.maxInFlight)
+		if cur <= m || atomic.CompareAndSwapInt32(&g.maxInFlight, m, cur) {
+			break
+		}
+	}
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	atomic.AddInt32(&g.inFlight, -1)
+}
+
+// TestController_BackfillManifest_Singleflight makes sure concurrent
+// backfills of the same artifact are coalesced into a single one, see
+// goharbor/harbor#24220.
+func (p *proxyControllerTestSuite) TestController_BackfillManifest_Singleflight() {
+	ctx := context.Background()
+	man, _, err := distribution.UnmarshalManifest(v1.MediaTypeImageManifest, []byte(ociManifest))
+	p.Require().NoError(err)
+	_, payload, err := man.Payload()
+	p.Require().NoError(err)
+	dig := string(digest.FromBytes(payload))
+
+	h := &gateCacheHandler{entered: make(chan struct{}), release: make(chan struct{})}
+	ctr := &controller{
+		local: p.local,
+		handlerRegistry: map[string]ManifestCacheHandler{
+			defaultHandler:            h,
+			v1.MediaTypeImageManifest: h,
+		},
+	}
+
+	art := lib.ArtifactInfo{
+		ProjectName: "dockerhub-proxy",
+		Repository:  "dockerhub-proxy/library/hello-world",
+		Digest:      dig,
+		Tag:         "latest",
+	}
+
+	const concurrency = 10
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctr.backfillManifest(ctx, "library/hello-world", man, art, v1.MediaTypeImageManifest, nil)
+		}()
+	}
+
+	// wait until the first backfill enters the handler, then give the other
+	// callers time to pile up on the singleflight while it is held open
+	<-h.entered
+	time.Sleep(500 * time.Millisecond)
+
+	p.Assert().Equal(int32(1), atomic.LoadInt32(&h.total),
+		"concurrent backfills of the same artifact must be coalesced into one")
+
+	close(h.release)
+	wg.Wait()
+	p.Assert().Equal(int32(1), atomic.LoadInt32(&h.total),
+		"no second backfill should start after the coalesced one finished")
+	p.Assert().Equal(int32(1), atomic.LoadInt32(&h.maxInFlight),
+		"backfills for the same key must never run concurrently")
 }
